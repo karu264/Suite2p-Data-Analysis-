@@ -1,6 +1,11 @@
 # Suite2p Data Analysis
 
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A comprehensive toolkit for analyzing calcium imaging data processed with Suite2p.
+
+📖 **[Quick Start](QUICKSTART.md)** | **[Documentation](docs/getting_started.md)** | **[API Reference](docs/api_reference.md)** | **[Examples](examples/)**
 
 ## Overview
 
@@ -11,6 +16,23 @@ Suite2p is a fast, accurate, and complete two-photon calcium imaging data analys
 - Analyzing cell responses and correlations
 - Statistical analysis of calcium imaging data
 - Batch processing multiple experiments
+
+## Quick Start
+
+```python
+from suite2p_analysis import load_suite2p_data, calculate_dff, plot_traces
+
+# Load data
+data = load_suite2p_data('path/to/suite2p/plane0')
+
+# Calculate dF/F
+dff = calculate_dff(data['F'], data['Fneu'])
+
+# Visualize
+plot_traces(dff, n_cells=10)
+```
+
+👉 See [QUICKSTART.md](QUICKSTART.md) for a 5-minute tutorial!
 
 ## Installation
 
