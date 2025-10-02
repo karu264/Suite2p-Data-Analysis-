@@ -1,0 +1,415 @@
+import sys
+import argparse
+from pathlib import Path
+from typing import Optional, List, Tuple
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# ------------------ EDIT THESE IF YOU LIKE DEFAULTS ------------------
+
+SESSION_DIRS: List[str] = [
+    "/Users/karimaghimire/Desktop/05042/Z2_OUT/output_master",
+    "/Users/karimaghimire/Desktop/05042/Z3_OUT/output_master",
+    "/Users/karimaghimire/Desktop/05042/Z1_OUT/output_master",
+]
+
+OUTPUT_DIR: str = ""              # "" => ../group_summary next to the first session
+METRICS_SOURCE: str = "suite2p"   # 'signals' or 'suite2p'
+
+# Plot knobs (keep simple)
+DEG_BIN: int = 15
+OSI_HIST_BINS: int = 15
+OSI_HIST_RANGE = (0.0, 1.0)
+FIG_DPI: int = 220
+
+TUNED_THRESH: float = 0.30  # Fraction tuned uses this OSI threshold
+
+
+# ---------------------------- HELPERS ----------------------------
+def ensure_outdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def resolve_output_dir(sessions: List[Path], out_arg: str) -> Path:
+    if out_arg:
+        return ensure_outdir(Path(out_arg))
+    first = sessions[0]
+    root = first if first.name != "output_master" else first.parent
+    return ensure_outdir(root.parent / "group_summary")
+
+
+def session_name_from_path(session_dir: Path) -> str:
+    return session_dir.parent.name if session_dir.name == "output_master" else session_dir.name
+
+
+def find_metrics_csv(session_dir: Path, source: str, suite2p_metric: str) -> Tuple[Optional[Path], str]:
+    """
+    Accepts .../output_master or a session root that contains it.
+    Returns (csv_path, resolved_label).
+    resolved_label is one of: 'signals', 'suite2p:spks', 'suite2p:rawf', 'suite2p:generic'
+    """
+    om = session_dir / "output_master" if session_dir.name != "output_master" else session_dir
+
+    if source == "signals":
+        f = om / "signals_cell_metrics.csv"
+        return (f if f.exists() else None, "signals")
+
+    # source == "suite2p"
+    spks_f = om / "suite2p_cell_metrics_spks.csv"
+    rawf_f = om / "suite2p_cell_metrics_rawF.csv"
+    genericf = om / "suite2p_cell_metrics.csv"
+
+    resolved = None
+    label = "suite2p:generic"
+
+    if suite2p_metric == "spks":
+        if spks_f.exists():
+            resolved, label = spks_f, "suite2p:spks"
+        elif genericf.exists():
+            resolved, label = genericf, "suite2p:generic"
+    elif suite2p_metric == "rawf":
+        if rawf_f.exists():
+            resolved, label = rawf_f, "suite2p:rawf"
+        elif genericf.exists():
+            resolved, label = genericf, "suite2p:generic"
+    else:  # auto
+        if spks_f.exists():
+            resolved, label = spks_f, "suite2p:spks"
+        elif rawf_f.exists():
+            resolved, label = rawf_f, "suite2p:rawf"
+        elif genericf.exists():
+            resolved, label = genericf, "suite2p:generic"
+
+    return (resolved, label)
+
+
+def half_polar_rose(ax, angles_deg: np.ndarray, bin_deg: int, title: str):
+    """Half-polar (0–180°) counts plot."""
+    a = np.mod(np.asarray(angles_deg, float), 180.0)
+    bins = np.arange(0, 180 + bin_deg, bin_deg)
+    hist, edges = np.histogram(a, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    theta = np.deg2rad(centers)
+    width = np.deg2rad(np.diff(edges))
+    ax.bar(theta, hist, width=width, bottom=0.0, align='center',
+           edgecolor='k', linewidth=0.6, alpha=0.9)
+    ax.set_theta_zero_location('N')   # 0° at the top
+    ax.set_theta_direction(-1)        # clockwise
+    ax.set_thetamin(0)
+    ax.set_thetamax(180)
+    ax.set_title(title)
+    return centers, hist
+
+
+# ------------- [NEW] Small helpers for per-session figures -------------
+
+def _safe_name(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
+
+
+def save_session_osi_hist(outdir: Path, name: str, osi_values: np.ndarray):
+    fig = plt.figure(figsize=(6.0, 4.2))
+    ax = fig.add_subplot(111)
+    ax.hist(osi_values, bins=OSI_HIST_BINS,
+            range=OSI_HIST_RANGE, edgecolor='k', alpha=0.9)
+    ax.set_xlabel("OSI")
+    ax.set_ylabel("Cell count")
+    ax.set_title(f"OSI distribution — {name}")
+    fig.tight_layout()
+    fname = outdir / f"per_session_osi_hist_{_safe_name(name)}.png"
+    fig.savefig(fname, dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[save] {fname}")
+
+
+def save_session_rose(outdir: Path, name: str, pref_deg_values: np.ndarray, bin_deg: int):
+    fig = plt.figure(figsize=(4.8, 4.8))
+    ax = fig.add_subplot(111, projection='polar')
+    half_polar_rose(ax, pref_deg_values, bin_deg=bin_deg,
+                    title=f"Orientation preference — {name}")
+    fig.tight_layout()
+    fname = outdir / f"per_session_rose_{_safe_name(name)}.png"
+    fig.savefig(fname, dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[save] {fname}")
+
+
+# ------------- [NEW] Robust per-session metric column normalization -------------
+
+def normalize_metrics_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Returns a DataFrame with columns: ['pref_deg','osi'] if possible.
+    Accepts variants like: 'pref_ori_deg','preferred_orientation','pref','OSI'.
+    Converts radians if only 'pref_ori_rad' exists.
+    Tries to avoid binary (0/1 or bool) 'osi' columns.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['pref_deg', 'osi']).copy()
+
+    # Rename common variants
+    rename_map = {
+        'pref_ori_deg': 'pref_deg',
+        'preferred_orientation': 'pref_deg',
+        'pref': 'pref_deg',
+        'pref_ori': 'pref_deg',
+        'OSI': 'osi',
+    }
+    df = df.rename(columns=rename_map)
+
+    # If radians present, convert
+    if 'pref_deg' not in df.columns and 'pref_ori_rad' in df.columns:
+        df['pref_deg'] = np.degrees(df['pref_ori_rad'])
+
+    # Choose a continuous 'osi' column if possible
+    osi_candidates = ['osi', 'osi_vm', 'osi_vonmises',
+                      'osi_spline', 'osi_cont', 'osi_raw']
+    chosen_osi = None
+    for c in osi_candidates:
+        if c in df.columns:
+            s = pd.to_numeric(df[c], errors='coerce')
+            vals = s.dropna().to_numpy()
+            if vals.size == 0:
+                continue
+            uniq = np.unique(vals)
+            looks_binary = (set(np.round(uniq, 6)).issubset(
+                {0.0, 1.0}) and len(uniq) <= 2) or s.dtype == bool
+            if not looks_binary:
+                chosen_osi = s.astype(float)
+                break
+
+    # Fallback: if only 'osi' exists and it's binary, still return it (we warn later)
+    if chosen_osi is None and 'osi' in df.columns:
+        chosen_osi = pd.to_numeric(df['osi'], errors='coerce').astype(float)
+
+    # Build normalized output
+    out = pd.DataFrame()
+    if 'pref_deg' in df.columns:
+        out['pref_deg'] = np.mod(pd.to_numeric(
+            df['pref_deg'], errors='coerce').astype(float), 180.0)
+    if chosen_osi is not None:
+        out['osi'] = chosen_osi
+
+    # Ensure both present
+    if not {'pref_deg', 'osi'}.issubset(out.columns):
+        return pd.DataFrame(columns=['pref_deg', 'osi']).copy()
+
+    return out
+
+
+# ------------- [NEW] Simple circular + OSI stats -------------
+
+def circ_axial_resultant_length(deg: np.ndarray) -> float:
+    """
+    Axial data (0-180): double the angles, compute resultant length R in [0,1].
+    Higher R => more concentrated around a direction.
+    """
+    a = np.deg2rad(np.mod(np.asarray(deg, float), 180.0) * 2.0)
+    C = np.nanmean(np.cos(a))
+    S = np.nanmean(np.sin(a))
+    if np.isnan(C) or np.isnan(S):
+        return np.nan
+    return float(np.hypot(C, S))
+
+
+def iqr(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    return float(np.percentile(x, 75) - np.percentile(x, 25))
+
+
+# ----------------------------- MAIN -----------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Minimal group CSV + one rose + one OSI histogram + stats.")
+    ap.add_argument("sessions", nargs="*",
+                    help="Paths to session roots or output_master folders.")
+    ap.add_argument("--source", choices=["signals", "suite2p"], default=METRICS_SOURCE,
+                    help="Which per-cell metrics CSV to use.")
+    ap.add_argument("--suite2p-metric", choices=["auto", "spks", "rawf"], default="auto",
+                    help="When --source suite2p: choose between spks/rawF CSVs (default: auto).")
+    ap.add_argument("--out", default=OUTPUT_DIR,
+                    help="Output folder (default: ../group_summary next to the first session).")
+    ap.add_argument("--bin", type=int, default=DEG_BIN,
+                    help="Degree bin width for the rose (default: 15).")
+    args = ap.parse_args()
+
+    sess_dirs = [Path(s)
+                 for s in (args.sessions if args.sessions else SESSION_DIRS)]
+    if not sess_dirs:
+        print("ERROR: no session folders provided.")
+        sys.exit(1)
+
+    outdir = resolve_output_dir(sess_dirs, args.out)
+    print(f"[out] {outdir}")
+
+    # ---- Load and stack (session, pref_deg, osi) ----
+    rows = []
+    per_session_summary = []  # [NEW]
+    for sess in sess_dirs:
+        csv_path, label = find_metrics_csv(
+            sess, args.source, args.suite2p_metric)
+        if csv_path is None:
+            print(
+                f"[skip] No metrics CSV in {sess} (source={args.source}, suite2p_metric={args.suite2p_metric}).")
+            continue
+
+        try:
+            df_raw = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"[skip] Failed to read {csv_path}: {e}")
+            continue
+
+        df = normalize_metrics_df(df_raw)  # [NEW]
+        if not {"pref_deg", "osi"}.issubset(df.columns):
+            print(
+                f"[skip] {csv_path} missing columns (after normalization): pref_deg, osi")
+            continue
+
+        name = session_name_from_path(sess)
+        a = df["pref_deg"].to_numpy(dtype=float)
+        o = df["osi"].to_numpy(dtype=float)
+        m = np.isfinite(a) & np.isfinite(o)
+        if not np.any(m):
+            print(f"[skip] No finite rows in {csv_path}")
+            continue
+
+        rows.append(pd.DataFrame(
+            {"session": name, "pref_deg": a[m], "osi": o[m]}))
+        print(
+            f"[load] {name}: n={int(m.sum())} cells  ←  used {label} ({csv_path.name})")
+
+        # [NEW] warn if OSI "looks" binary (likely a tuned flag 0/1)
+        ov = o[m]
+        if ov.size > 0:
+            uniq = np.unique(np.round(ov, 6))
+            if (len(uniq) <= 2) and set(uniq).issubset({0.0, 1.0}):
+                print(f"[warn] {name}: 'osi' looks binary (unique={uniq}). "
+                      f"This suggests a True/False tuned flag was read as numbers.")
+
+        # [NEW] per-session quick stats
+        osi_median = float(np.nanmedian(ov))
+        osi_iqr = iqr(ov)
+        frac_tuned = float(np.mean(ov >= TUNED_THRESH))
+        R_axial = circ_axial_resultant_length(a[m])
+        per_session_summary.append({
+            "session": name,
+            "n_cells": int(m.sum()),
+            "osi_median": osi_median,
+            "osi_IQR": osi_iqr,
+            "frac_tuned_osi>=0.30": frac_tuned,
+            "axial_resultant_R": R_axial,
+        })
+
+        # [NEW] per-session figures
+        save_session_osi_hist(outdir, name, ov)
+        save_session_rose(outdir, name, a[m], bin_deg=args.bin)
+
+    if not rows:
+        print("ERROR: nothing loaded.")
+        sys.exit(1)
+
+    group = pd.concat(rows, ignore_index=True)
+
+    # ---- Save the single CSV ----
+    csv_path = outdir / "group_prefdeg_osi.csv"
+    group.to_csv(csv_path, index=False)
+    print(f"[save] {csv_path}")
+
+    # ---- Re-load FROM CSV to make the plots (so figures truly come from the CSV) ----
+    dfc = pd.read_csv(csv_path)
+    pref = np.mod(dfc["pref_deg"].to_numpy(dtype=float), 180.0)
+    osi = dfc["osi"].to_numpy(dtype=float)
+
+    # ---- Canonical 4-angle summary (CSV + bar chart) ----
+    CANON = np.array([0.0, 45.0, 90.0, 135.0], dtype=float)
+
+    def circdist180(a, b):
+        d = np.abs(a - b) % 180.0
+        return np.minimum(d, 180.0 - d)
+
+    dists = np.stack([circdist180(pref, a) for a in CANON], axis=1)  # (N, 4)
+    nearest_idx = np.argmin(dists, axis=1)
+    nearest_angle = CANON[nearest_idx]
+
+    counts4 = [int(np.sum(nearest_angle == a)) for a in CANON]
+    df4 = pd.DataFrame({"angle_deg": CANON.astype(int), "count": counts4})
+    df4.to_csv(outdir / "group_pref_counts_4angles.csv", index=False)
+    print(df4)
+
+    fig = plt.figure(figsize=(5.0, 3.6))
+    ax = fig.add_subplot(111)
+    ax.bar(df4["angle_deg"], df4["count"], width=18, edgecolor='k', alpha=0.9)
+    ax.set_xticks([0, 45, 90, 135])
+    ax.set_xlabel("Preferred angle (deg)")
+    ax.set_ylabel("Cell count")
+    ax.set_title("Counts per Preferred Angle")
+    fig.tight_layout()
+    fig.savefig(outdir / "group_pref_counts_4angles_bar.png",
+                dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- ONE half-polar (counts) ----
+    fig = plt.figure(figsize=(4.8, 4.8))
+    ax = fig.add_subplot(111, projection='polar')
+    half_polar_rose(ax, pref, bin_deg=args.bin,
+                    title="Orientation preference (counts) — group")
+    fig.tight_layout()
+    fig.savefig(outdir / "group_rose_counts.png",
+                dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---- ONE OSI histogram ----
+    fig = plt.figure(figsize=(6.0, 4.2))
+    ax = fig.add_subplot(111)
+    ax.hist(osi, bins=OSI_HIST_BINS, range=OSI_HIST_RANGE,
+            edgecolor='k', alpha=0.9)
+    ax.set_xlabel("OSI")
+    ax.set_ylabel("Cell count")
+    ax.set_title("OSI distribution — group")
+    fig.tight_layout()
+    fig.savefig(outdir / "group_osi_hist.png",
+                dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # ---------------- [NEW] Group + per-session stats outputs ----------------
+    # Group stats
+    group_osi_median = float(np.nanmedian(osi))
+    group_osi_iqr = iqr(osi)
+    group_frac_tuned = float(np.mean(osi >= TUNED_THRESH))
+    group_R_axial = circ_axial_resultant_length(pref)
+
+    txt = outdir / "group_stats.txt"
+    with open(txt, "w") as f:
+        f.write("=== Group summary (from group_prefdeg_osi.csv) ===\n")
+        f.write(f"Total cells: {len(osi)}\n")
+        f.write(f"OSI median: {group_osi_median:.3f}\n")
+        f.write(f"OSI IQR: {group_osi_iqr:.3f}\n")
+        f.write(
+            f"Fraction tuned (OSI ≥ {TUNED_THRESH:.2f}): {group_frac_tuned:.3f}\n")
+        f.write(f"Axial resultant length R (0–1): {group_R_axial:.3f}\n")
+        f.write("\n--- Per-session quick stats ---\n")
+        for row in per_session_summary:
+            f.write(
+                f"{row['session']}: n={row['n_cells']}, "
+                f"OSI median={row['osi_median']:.3f}, IQR={row['osi_IQR']:.3f}, "
+                f"Frac tuned={row['frac_tuned_osi>=0.30']:.3f}, "
+                f"R={row['axial_resultant_R']:.3f}\n"
+            )
+    print(f"[save] {txt}")
+
+    # Per-session CSV
+    ps_path = outdir / "per_session_stats.csv"
+    pd.DataFrame(per_session_summary).to_csv(ps_path, index=False)
+    print(f"[save] {ps_path}")
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
