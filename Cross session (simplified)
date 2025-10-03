@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+CrossSesh_bias_check.py — paste-and-run, fully functional (dummy-proof)
+
+What it does (no rose plots):
+- Uses hardcoded session directories by default (see SESSION_DIRS below). You can still pass paths.
+- Saves ONE combined CSV: session, pref_deg, osi
+- Saves ONE per-cell audit CSV with 4-angle assignment + distances (bias check)
+- Makes ONE group OSI histogram and ONE 4-angle bar chart
+- Writes a text stats report and a per-session stats CSV
+
+Usage examples:
+  # use hardcoded defaults
+  python CrossSesh_bias_check.py
+
+  # or pass folders (either session roots or .../output_master) and/or a custom out dir
+  python CrossSesh_bias_check.py /path/Z2/output_master /path/Z3 /path/Z1 --out /path/group_summary
+
+Outputs (in OUTPUT_DIR):
+  group_prefdeg_osi.csv               (now includes cell_id)
+  group_prefdeg_with_bins.csv         (includes cell_id + distances)
+  group_pref_counts_4angles.csv
+  group_pref_counts_4angles_bar.png
+  group_osi_hist.png
+  group_stats.txt
+  per_session_stats.csv
+"""
+
+import matplotlib.pyplot as plt
+import sys
+import argparse
+import os
+from pathlib import Path
+from typing import List, Optional
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use("Agg")  # safe for headless
+
+# ---------------------------- CONFIG ----------------------------
+# Hardcoded sessions (from your original script). You can still pass args to override.
+SESSION_DIRS: List[str] = [
+    "/Users/karimaghimire/Desktop/05042/Z2_OUT/output_master",
+    "/Users/karimaghimire/Desktop/05042/Z3_OUT/output_master",
+    "/Users/karimaghimire/Desktop/05042/Z1_OUT/output_master",
+]
+OUTPUT_DIR: str = ""  # "" => ../group_summary next to the first discovered/used session
+
+# Plots & stats
+OSI_HIST_BINS: int = 15
+OSI_HIST_RANGE = (0.0, 1.0)
+FIG_DPI: int = 220
+TUNED_THRESH: float = 0.30
+
+# ---------------------------- HELPERS ----------------------------
+
+
+def ensure_outdir(p: Path) -> Path:
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def resolve_output_dir(sessions: List[Path], out_arg: str) -> Path:
+    if out_arg:
+        return ensure_outdir(Path(out_arg))
+    first = sessions[0]
+    root = first if first.name != "output_master" else first.parent
+    return ensure_outdir(root.parent / "group_summary")
+
+
+def session_name_from_path(session_dir: Path) -> str:
+    return session_dir.parent.name if session_dir.name == "output_master" else session_dir.name
+
+
+def find_metrics_file(session_dir: Path) -> Optional[Path]:
+    """Return best-available per-cell metrics CSV under .../output_master.
+    Accepts either a session root (that contains output_master) or output_master itself.
+    Priority (first found wins): spks, rawF, generic, signals.
+    """
+    om = session_dir / "output_master" if session_dir.name != "output_master" else session_dir
+    cands = [
+        om / "suite2p_cell_metrics_spks.csv",
+        om / "suite2p_cell_metrics_rawF.csv",
+        om / "suite2p_cell_metrics.csv",
+        om / "signals_cell_metrics.csv",
+    ]
+    for f in cands:
+        if f.exists():
+            return f
+    return None
+
+
+def normalize_metrics_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Return ['pref_deg','osi'] with robust renames + unit fix."""
+    rename_map = {
+        'pref_ori_deg': 'pref_deg',
+        'preferred_orientation': 'pref_deg',
+        'pref': 'pref_deg',
+        'pref_ori': 'pref_deg',
+        'OSI': 'osi',
+    }
+    df = df.rename(columns=rename_map)
+    if 'pref_deg' not in df and 'pref_ori_rad' in df:
+        df['pref_deg'] = np.degrees(df['pref_ori_rad'])
+    out = pd.DataFrame()
+    if 'pref_deg' in df:
+        out['pref_deg'] = np.mod(pd.to_numeric(
+            df['pref_deg'], errors='coerce'), 180.0)
+    if 'osi' in df:
+        out['osi'] = pd.to_numeric(df['osi'], errors='coerce')
+    need = {'pref_deg', 'osi'}
+    return out[list(need)] if need.issubset(out.columns) else pd.DataFrame(columns=list(need))
+
+
+def circ_axial_resultant_length(deg: np.ndarray) -> float:
+    a = np.deg2rad(np.mod(np.asarray(deg, float), 180.0) * 2.0)
+    return float(np.hypot(np.nanmean(np.cos(a)), np.nanmean(np.sin(a))))
+
+
+def iqr(x: np.ndarray) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    return float(np.percentile(x, 75) - np.percentile(x, 25)) if x.size > 0 else np.nan
+
+# ----------------------------- MAIN -----------------------------
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Simple group summary (bias-check friendly; hardcoded defaults, or pass paths).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    ap.add_argument("sessions", nargs="*",
+                    help="Paths to session roots or output_master folders (optional).")
+    ap.add_argument("--out", default=OUTPUT_DIR,
+                    help="Output folder (default: ../group_summary next to the first session).")
+    args = ap.parse_args()
+
+    if args.sessions:
+        sess_dirs = [Path(s) for s in args.sessions]
+    elif SESSION_DIRS:
+        print("[info] Using hardcoded SESSION_DIRS from script.")
+        sess_dirs = [Path(s) for s in SESSION_DIRS]
+    else:
+        print("ERROR: no sessions provided and SESSION_DIRS is empty.")
+        sys.exit(1)
+
+    outdir = resolve_output_dir(sess_dirs, args.out)
+    print(f"[out] {outdir}")
+
+    rows: List[pd.DataFrame] = []
+    per_session_summary = []
+    for sess in sess_dirs:
+        f = find_metrics_file(sess)
+        if f is None:
+            print(f"[skip] No metrics CSV in {sess}")
+            continue
+        try:
+            df = normalize_metrics_df(pd.read_csv(f))
+        except Exception as e:
+            print(f"[skip] Failed to read {f}: {e}")
+            continue
+        if df.empty:
+            print(f"[skip] {f} (missing pref_deg/osi after normalization)")
+            continue
+        name = session_name_from_path(sess)
+        a = df['pref_deg'].to_numpy()
+        o = df['osi'].to_numpy()
+        m = np.isfinite(a) & np.isfinite(o)
+        if not np.any(m):
+            print(f"[skip] {f} (no finite rows)")
+            continue
+        n_cells = int(m.sum())
+        ids = [f"{name}_cell{i+1:04d}" for i in range(n_cells)]
+        rows.append(pd.DataFrame(
+            {'session': name, 'cell_id': ids, 'pref_deg': a[m], 'osi': o[m]}))
+        per_session_summary.append({
+            'session': name,
+            'n_cells': int(m.sum()),
+            'osi_median': float(np.nanmedian(o[m])),
+            'osi_IQR': iqr(o[m]),
+            'frac_tuned_osi>=0.30': float(np.mean(o[m] >= TUNED_THRESH)),
+            'axial_resultant_R': circ_axial_resultant_length(a[m]),
+        })
+        print(f"[load] {name}: n={int(m.sum())} cells  ←  {f}")
+
+    if not rows:
+        print("ERROR: nothing loaded. (No sessions with usable CSVs.)")
+        sys.exit(1)
+
+    group = pd.concat(rows, ignore_index=True)
+
+    # ---- Save the single CSV ----
+    csv_group = outdir / "group_prefdeg_osi.csv"
+    group.to_csv(csv_group, index=False)
+    print(f"[save] {csv_group}")
+
+    # ---- Recompute figures/stats FROM CSV (source of truth) ----
+    dfc = pd.read_csv(csv_group)
+    pref = np.mod(dfc['pref_deg'].to_numpy(), 180.0)
+    osi = dfc['osi'].to_numpy()
+
+    # 4-angle assignment (axial nearest-neighbor with deterministic higher-angle tiebreak)
+    CANON = np.array([0.0, 45.0, 90.0, 135.0])
+
+    def circdist180(a, b):
+        d = np.abs(a - b) % 180.0
+        return np.minimum(d, 180.0 - d)
+    dists = np.stack([circdist180(pref, a) for a in CANON], axis=1)
+    eps = np.linspace(0, 3e-9, dists.shape[1])
+    nearest_idx = np.argmin(dists - eps, axis=1)
+    nearest_angle = CANON[nearest_idx]
+
+    # Per-cell audit CSV with distances & tie info
+    audit = dfc.copy()
+    audit['nearest_angle'] = nearest_angle
+    for i, a in enumerate(CANON.astype(int)):
+        audit[f'dist_to_{a}'] = dists[:, i]
+    mins = dists.min(axis=1, keepdims=True)
+    audit['tie_equal_mins'] = (np.isclose(dists, mins)).sum(axis=1) > 1
+    audit['chosen_min_dist'] = dists[np.arange(dists.shape[0]), nearest_idx]
+    audit['tiebreak_mode'] = 'deterministic_higher'
+    csv_audit = outdir / "group_prefdeg_with_bins.csv"
+    audit.to_csv(csv_audit, index=False)
+    print(f"[save] {csv_audit}")
+
+    # 4-angle counts + bar chart
+    df4 = pd.DataFrame({
+        'angle_deg': CANON.astype(int),
+        'count': [int(np.sum(nearest_angle == a)) for a in CANON]
+    })
+    csv_counts = outdir / "group_pref_counts_4angles.csv"
+    df4.to_csv(csv_counts, index=False)
+    print(f"[save] {csv_counts}")
+
+    fig, ax = plt.subplots(figsize=(5.2, 3.6))
+    ax.bar(df4['angle_deg'], df4['count'], width=18, edgecolor='k', alpha=0.9)
+    ax.set_xticks([0, 45, 90, 135])
+    ax.set_xlabel("Preferred angle (deg)")
+    ax.set_ylabel("Cell count")
+    ax.set_title("Counts per Preferred Angle")
+    fig.tight_layout()
+    fig.savefig(outdir / "group_pref_counts_4angles_bar.png",
+                dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # OSI histogram (group)
+    fig, ax = plt.subplots(figsize=(6.0, 4.2))
+    ax.hist(osi, bins=OSI_HIST_BINS, range=OSI_HIST_RANGE,
+            edgecolor='k', alpha=0.9)
+    ax.set_xlabel("OSI")
+    ax.set_ylabel("Cell count")
+    ax.set_title("OSI distribution — group")
+    fig.tight_layout()
+    fig.savefig(outdir / "group_osi_hist.png",
+                dpi=FIG_DPI, bbox_inches="tight")
+    plt.close(fig)
+
+    # Group + per-session stats
+    txt = outdir / "group_stats.txt"
+    with open(txt, "w") as f:
+        f.write("=== Group summary (from group_prefdeg_osi.csv) ===")
+        f.write(f"Total cells: {len(osi)}")
+        f.write(f"OSI median: {float(np.nanmedian(osi)):.3f} ")
+        f.write(f"OSI IQR: {iqr(osi):.3f} ")
+        f.write(
+            f"Fraction tuned (OSI ≥ {TUNED_THRESH:.2f}): {float(np.mean(osi >= TUNED_THRESH)):.3f} ")
+        f.write(
+            f"Axial resultant length R (0–1): {circ_axial_resultant_length(pref):.3f}")
+        f.write("--- Per-session quick stats --- ")
+        for row in per_session_summary:
+            f.write(
+                f"{row['session']}: n={row['n_cells']}, "
+                f"OSI median={row['osi_median']:.3f}, IQR={row['osi_IQR']:.3f}, "
+                f"Frac tuned={row['frac_tuned_osi>=0.30']:.3f}, "
+                f"R={row['axial_resultant_R']:.3f} "
+            )
+    print(f"[save] {txt}")
+
+    ps = outdir / "per_session_stats.csv"
+    pd.DataFrame(per_session_summary).to_csv(ps, index=False)
+    print(f"[save] {ps}")
+
+    print("Done.")
+
+
+if __name__ == '__main__':
+    main()
