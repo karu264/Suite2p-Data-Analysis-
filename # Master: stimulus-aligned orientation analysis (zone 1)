@@ -1,0 +1,1125 @@
+# ============================================
+# Master: stimulus-aligned orientation analysis
+# ============================================
+
+import os
+from pathlib import Path
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from datetime import datetime
+import zoneinfo
+
+from scipy.optimize import curve_fit
+from scipy.special import i0
+from scipy.interpolate import make_interp_spline
+from scipy.stats import zscore
+
+# ----------------------===== USER INPUTS =====----------------------
+
+signals_csv_path = "/Users/karimaghimire/Desktop/05042/Z1_OUT/Z1_OUT.csv"
+stimlog_csv_path = "/Users/karimaghimire/Desktop/05042/Z1_OUT/stimulus_log.csv"
+output_dir = Path("/Users/karimaghimire/Desktop/05042/Z1_OUT/output_master")
+S2P_DIR = Path("/Users/karimaghimire/Desktop/05042/Z1_OUT/suite2p/plane0")
+
+USE_HUMAN_IMAGING_START = True
+imaging_start_human = "2025-05-06 11:29:38.927"  # local human time w/ ms
+local_tz = zoneinfo.ZoneInfo("Europe/London")
+imaging_start_unix_s_override = None
+
+fps = 7.67
+
+save_figs = True
+show_figs = False
+
+DO_PER_CELL_PLOTS = True
+ORDER_HEATMAPS = True
+ORDER_METHOD = 'peak_time'  # 'peak_time' or 'activity'
+
+N_BEST_EXAMPLE = 6
+N_BEST_TUNING = 6
+CLIP_NEGATIVE_SPLINE = True
+
+# Aesthetics (maps)
+DOT_REF_PERCENTILE = 90
+DOT_SIZE_BASE = 30
+DOT_SIZE_GAIN = 100
+DOT_SCALE_MODE = 'sqrt'
+
+PREF_CMAP = 'twilight_shifted'
+OSI_CMAP = 'viridis'
+
+DOT_ALPHA = 0.95
+EDGE_LW = 0.8
+WHITE_HALO_LW = 1.6
+JITTER_PX = 0.0
+INSUFFICIENT_GRAY = '#C8C8C8'
+
+# Stimulus → angle
+label_to_angle = {
+    'flicker_1': 0,
+    'flicker_2': 45,
+    'flicker_3': 90,
+    'flicker_4': 135,
+    'flicker_5': 135,  # catch → 135
+}
+
+NEUCOEFF = 0.7
+
+# -----------------------===== HELPERS =========-----------------------------------------------------------
+
+
+def ensure_outdir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def load_signals_keep_y(csv_path: str):
+    df = pd.read_csv(csv_path)
+    ycols = [c for c in df.columns if 'y' in str(c).lower()]
+    if not ycols:
+        ycols = list(df.columns[1::2])
+    if not ycols:
+        raise ValueError("No Y columns found in signals CSV.")
+    Y = df[ycols].apply(pd.to_numeric, errors='coerce').to_numpy()
+    if Y.shape[0] < Y.shape[1]:
+        Y = Y.T
+    return Y, ycols
+
+
+def load_stimlog_csv(stim_csv_path: str):
+    df = pd.read_csv(stim_csv_path)
+    required = ['Stimulus', 'Iteration', 'Start time', 'End time']
+    for col in required:
+        if col not in df.columns:
+            raise ValueError(f"Stim log missing column: {col}")
+    return (df['Stimulus'].astype(str).tolist(),
+            df['Iteration'].astype(int).tolist(),
+            df['Start time'].astype(np.int64).to_numpy(),
+            df['End time'].astype(np.int64).to_numpy())
+
+
+def to_unix_from_human(dt_str: str, tz) -> float:
+    dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=tz)
+    return dt.timestamp()
+
+
+def dff_epoch_trace(trace_1d: np.ndarray) -> np.ndarray:
+    if trace_1d.size == 0 or np.all(~np.isfinite(trace_1d)):
+        return np.zeros_like(trace_1d, dtype=float)
+    p10 = np.nanpercentile(trace_1d, 10)
+    F0 = p10 if np.isfinite(p10) and p10 > 0 else np.nanmedian(trace_1d)
+    if not np.isfinite(F0) or F0 <= 0:
+        F0 = 1e-6
+    return (trace_1d - F0) / F0
+
+
+def stimlog_to_frames(start_ms: np.ndarray, end_ms: np.ndarray, imaging_start_unix_s: float, fs: float, n_time_all: int):
+    looks_unix = np.nanmedian(start_ms) > 1e11
+    if looks_unix:
+        offsets_s = (start_ms / 1000.0) - imaging_start_unix_s
+        start_fr = np.round(offsets_s * fs).astype(int)
+        end_fr = np.round(
+            ((end_ms / 1000.0) - imaging_start_unix_s) * fs).astype(int)
+        mode = 'absolute_unix_ms'
+    else:
+        offsets_s = start_ms / 1000.0
+        start_fr = np.round(offsets_s * fs).astype(int)
+        end_fr = np.round((end_ms / 1000.0) * fs).astype(int)
+        mode = 'relative_ms'
+    start_fr = np.clip(start_fr, 0, n_time_all - 1)
+    end_fr = np.clip(end_fr, 0, n_time_all)
+    for i in range(len(start_fr)):
+        if end_fr[i] <= start_fr[i]:
+            end_fr[i] = min(n_time_all, start_fr[i] +
+                            max(1, int(round(0.5 * fs))))
+    return start_fr, end_fr, offsets_s, mode
+
+
+def get_best_cells(Y_all: np.ndarray, epoch_starts: np.ndarray, epoch_ends: np.ndarray, n_best: int = 4):
+    n_cells = Y_all.shape[1]
+    peaks = np.zeros(n_cells)
+    for c in range(n_cells):
+        dff_all = [dff_epoch_trace(Y_all[s:e, c])
+                   for s, e in zip(epoch_starts, epoch_ends)]
+        valid_peaks = [np.nanmax(ep) for ep in dff_all if ep.size > 0]
+        peaks[c] = max(valid_peaks) if valid_peaks else -np.inf
+    return np.argsort(peaks)[::-1][:n_best]
+
+
+def von_mises(x, A, kappa, mu, baseline):
+    return A * np.exp(kappa * np.cos(np.deg2rad(x - mu))) / (2*np.pi*i0(kappa)) + baseline
+
+
+def fit_von_mises(angles, responses):
+    try:
+        p0 = [np.nanmax(responses), 1.0, angles[int(
+            np.nanargmax(responses))], np.nanmin(responses)]
+        popt, _ = curve_fit(von_mises, angles, responses, p0=p0, maxfev=5000)
+        return popt
+    except Exception as e:
+        warnings.warn(f"von Mises fit failed: {e}")
+        return None
+
+
+def iqr(x):
+    x = np.asarray(x)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return np.nan
+    return np.nanpercentile(x, 75) - np.nanpercentile(x, 25)
+
+
+# --------------------------===== LOAD & ALIGN =======-------------------------------------------------
+ensure_outdir(output_dir)
+
+if USE_HUMAN_IMAGING_START:
+    imaging_start_unix_s = to_unix_from_human(imaging_start_human, local_tz)
+else:
+    if imaging_start_unix_s_override is None:
+        raise ValueError(
+            "Set imaging_start_unix_s_override if not using human time.")
+    imaging_start_unix_s = float(imaging_start_unix_s_override)
+print(f"[time] imaging_start_unix_s = {imaging_start_unix_s:.3f}")
+
+Y_all, ycols = load_signals_keep_y(str(signals_csv_path))
+n_time_all, n_cells_all = Y_all.shape
+print(
+    f"[signals] Y shape = {Y_all.shape} (time × cells) — duration ≈ {n_time_all/fps:.2f}s @ {fps} Hz")
+
+stim_labels, iterations, start_ms, end_ms = load_stimlog_csv(
+    str(stimlog_csv_path))
+stim_labels = ['flicker_5' if s == 'catch' else s for s in stim_labels]
+print(f"[stimlog] Loaded {len(stim_labels)} epochs")
+
+epoch_starts, epoch_ends, offsets_s, timing_mode = stimlog_to_frames(
+    start_ms, end_ms, imaging_start_unix_s, fps, n_time_all)
+print(f"[debug] timing_mode = {timing_mode}")
+print(f"[debug] epochs: {len(epoch_starts)} starts, {len(epoch_ends)} ends")
+print(f"[debug] first 3 epoch frame ranges:",
+      list(zip(epoch_starts[:3], epoch_ends[:3])))
+print("\n=== Timing Info ===")
+print(f"Mode: {timing_mode}")
+print(f"Imaging start (Unix s): {imaging_start_unix_s:.3f}")
+print(f"First stim timestamp (s in log): {start_ms[0]/1000.0:.3f}")
+print(
+    f"First stim offset vs imaging start: {offsets_s[0]:.3f} s (≈ frame {int(round(offsets_s[0]*fps))})")
+
+valid = (epoch_starts >= 0) & (epoch_starts < n_time_all)
+if not np.all(valid):
+    bad = np.where(~valid)[0].tolist()
+    print(f"[warn] Dropping out-of-range epochs: {bad}")
+    epoch_starts = epoch_starts[valid]
+    epoch_ends = epoch_ends[valid]
+    stim_labels = [lab for k, lab in enumerate(stim_labels) if valid[k]]
+    iterations = [it for k, it in enumerate(iterations) if valid[k]]
+
+trials = pd.DataFrame({
+    'trial': iterations,
+    'label': stim_labels,
+    'ori_deg': [label_to_angle.get(lbl, np.nan) for lbl in stim_labels],
+    'start_frame': epoch_starts,
+    'end_frame': epoch_ends,
+    'start_time_s': epoch_starts / fps,
+    'end_time_s':   epoch_ends / fps,
+})
+ensure_outdir(output_dir)
+trials_csv_out = output_dir / 'trials.csv'
+trials.to_csv(trials_csv_out, index=False)
+print(f"[save] Wrote aligned trials.csv → {trials_csv_out}")
+
+if S2P_DIR.exists():
+    (S2P_DIR / 'trials.csv').write_text(trials.to_csv(index=False))
+    print(f"[save] Wrote trials.csv copy → {S2P_DIR / 'trials.csv'}")
+else:
+    print(f"[info] S2P_DIR not found → skipping suite2p copy: {S2P_DIR}")
+
+# ------------------------------ ===== Select best cells  ===== ------------------------------
+best_idx_4 = get_best_cells(
+    Y_all, epoch_starts, epoch_ends, n_best=N_BEST_EXAMPLE)
+best_idx_k = get_best_cells(
+    Y_all, epoch_starts, epoch_ends, n_best=max(N_BEST_TUNING, N_BEST_EXAMPLE))
+
+# Fixed order for tuning panel — no randomization
+panel_cells = best_idx_k[:N_BEST_TUNING]
+
+print(f"[selection] Best {N_BEST_EXAMPLE}: {[i+1 for i in best_idx_4]}")
+print(
+    f"[selection] Tuning panel ({N_BEST_TUNING}): {[i+1 for i in panel_cells]}")
+
+# --------------------------------------------===== Per-cell pipeline for top 4 cells =====---------------------------------------------
+if DO_PER_CELL_PLOTS:
+    for c in best_idx_4:
+        cell_trace = Y_all[:, c]
+        raw_epochs = [cell_trace[s:e]
+                      for s, e in zip(epoch_starts, epoch_ends)]
+        cell_epochs_dff = [dff_epoch_trace(ep) for ep in raw_epochs]
+
+        # 1) Epoch sequence — FULL recording with stim markers
+        cell_dff_full = dff_epoch_trace(cell_trace)
+        t_full = np.arange(len(cell_dff_full)) / fps
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(t_full, cell_dff_full, linewidth=1, label='ΔF/F (full)')
+
+        for i, (s, e) in enumerate(zip(epoch_starts, epoch_ends)):
+            xs, xe = s / fps, e / fps
+            plt.axvline(xs, linestyle='--', linewidth=0.8,
+                        alpha=0.8, color='k')
+            plt.axvline(xe, linestyle='--', linewidth=0.8,
+                        alpha=0.4, color='k')
+            lbl = stim_labels[i] if i < len(stim_labels) else f'epoch{i+1}'
+            xs = float(s) / fps
+            local_med = np.nanmedian(
+                cell_dff_full[max(0, int(s)-10):int(s)+10])
+            plt.text(xs, local_med + 0.02, lbl, rotation=90,
+                     va='bottom', ha='right', fontsize=8, alpha=0.9)
+
+        plt.xlabel('Time (s)')
+        plt.ylabel('ΔF/F')
+        plt.title(
+            f'Neuron {c+1} — Full Recording with Stimulus Epochs (dotted)')
+        plt.xlim(0, n_time_all / fps)
+        if save_figs:
+            plt.savefig(
+                output_dir / f"n{c+1}_epoch_sequence_FULL.png", dpi=150, bbox_inches='tight')
+        if show_figs:
+            plt.show()
+        plt.close()
+
+        # 2) Averaged traces per stimulus label
+        avg_by_label = {}
+        for lbl in sorted(set(stim_labels)):
+            idxs = [i for i, l in enumerate(stim_labels) if l == lbl]
+            if not idxs:
+                continue
+            traces = [cell_epochs_dff[i] for i in idxs]
+            Lmin = min(len(t) for t in traces)
+            if Lmin <= 0:
+                continue
+            stack = np.stack([t[:Lmin] for t in traces], axis=0)
+            avg_by_label[lbl] = np.nanmean(stack, axis=0)
+
+        plt.figure()
+        for lbl, avg in avg_by_label.items():
+            t_avg = np.arange(len(avg)) / fps
+            plt.plot(t_avg, avg, label=lbl)
+        plt.xlabel('Time (s)')
+        plt.ylabel('ΔF/F (avg)')
+        plt.title(f'Neuron {c+1} — Averaged Traces')
+        plt.legend()
+        if save_figs:
+            plt.savefig(
+                output_dir / f"n{c+1}_avg_traces.png", dpi=150, bbox_inches='tight')
+        if show_figs:
+            plt.show()
+        plt.close()
+
+        # 3) Tuning curve (peaks) with von Mises + spline
+        peaks_by_label = {lbl: float(
+            np.nanmax(tr)) for lbl, tr in avg_by_label.items() if lbl in label_to_angle}
+        if len(peaks_by_label) >= 2:
+            angle_bins = {}
+            for lbl, pk in peaks_by_label.items():
+                ang = int(label_to_angle[lbl])
+                angle_bins.setdefault(ang, []).append(pk)
+
+            ori_angles_deg = np.array(sorted(angle_bins.keys()), dtype=float)
+            ori_responses = np.array([np.nanmean(angle_bins[a])
+                                     for a in sorted(angle_bins)], dtype=float)
+
+            CANON = np.array([0, 45, 90, 135], dtype=float)
+            keep_mask = np.isin(ori_angles_deg, CANON)
+            ori_angles_deg = ori_angles_deg[keep_mask]
+            ori_responses = ori_responses[keep_mask]
+
+            si = np.argsort(ori_angles_deg)
+            ori_angles_deg = ori_angles_deg[si]
+            ori_responses = ori_responses[si]
+
+            plt.figure()
+            plt.plot(ori_angles_deg, ori_responses, 'ko', label='data')
+
+            popt = fit_von_mises(ori_angles_deg, ori_responses)
+            if popt is not None:
+                x_fit = np.linspace(0, 180, 200)
+                y_fit = von_mises(x_fit, *popt)
+                if CLIP_NEGATIVE_SPLINE:
+                    y_fit = np.clip(y_fit, 0, None)
+                plt.plot(x_fit, y_fit, 'r-', label='von Mises')
+
+            try:
+                x_spline = np.linspace(0, 180, 200)
+                spl = make_interp_spline(
+                    ori_angles_deg, ori_responses, k=min(3, len(ori_angles_deg)-1))
+                y_spl = spl(x_spline)
+                if CLIP_NEGATIVE_SPLINE:
+                    y_spl = np.clip(y_spl, 0, None)
+                plt.plot(x_spline, y_spl, 'b--', label='spline')
+            except Exception as e:
+                warnings.warn(f"Spline failed (cell {c+1}): {e}")
+
+            plt.xlabel('Orientation (°)')
+            plt.ylabel('Peak ΔF/F')
+            plt.title(f'Neuron {c+1} tuning curve')
+            plt.xticks([0, 45, 90, 135], ['0', '45', '90', '135'])
+            plt.legend()
+            if save_figs:
+                plt.savefig(
+                    output_dir / f"n{c+1}_tuning_curve.png", dpi=150, bbox_inches='tight')
+            if show_figs:
+                plt.show()
+            plt.close()
+
+print("[debug] Y_all shape (time x cells):", Y_all.shape)
+print("[debug] epoch count:", len(epoch_starts))
+lens_frames = (epoch_ends - epoch_starts).astype(int)
+print("[debug] epoch length stats (frames): min/med/max =", int(np.nanmin(lens_frames)),
+      int(np.nanmedian(lens_frames)), int(np.nanmax(lens_frames)))
+print("[debug] epoch length stats (s):     min/med/max =", np.nanmin(lens_frames) /
+      fps, np.nanmedian(lens_frames)/fps, np.nanmax(lens_frames)/fps)
+
+
+def _nonempty_epochs_for_cell(ci):
+    cnt = 0
+    for s, e in zip(epoch_starts, epoch_ends):
+        ep = dff_epoch_trace(Y_all[s:e, ci])
+        if ep.size and np.isfinite(np.nanmax(ep)):
+            cnt += 1
+    return cnt
+
+
+nonempty_counts = np.array([_nonempty_epochs_for_cell(ci)
+                           for ci in range(Y_all.shape[1])])
+print("[debug] non-empty epochs per cell: min/med/max =", int(np.min(nonempty_counts)),
+      int(np.median(nonempty_counts)), int(np.max(nonempty_counts)))
+
+
+def _peak_of_cell(ci):
+    vals = []
+    for s, e in zip(epoch_starts, epoch_ends):
+        ep = dff_epoch_trace(Y_all[s:e, ci])
+        if ep.size:
+            vals.append(np.nanmax(ep))
+    return float(np.nanmax(vals)) if len(vals) else np.nan
+
+
+print("[debug] Best-4 (1-based):", [i+1 for i in best_idx_4])
+print("[debug] Peaks of Best-4:",
+      {int(i): _peak_of_cell(int(i)) for i in best_idx_4})
+nan_mask = np.array([np.isnan(_peak_of_cell(ci))
+                    for ci in range(Y_all.shape[1])])
+print("[debug] cells with NaN peak:", int(
+    nan_mask.sum()), "out of", Y_all.shape[1])
+
+# ------------------------------------------------- ===== Von Mises panel for best K cells (tuning) == -------------------------------------------------
+vm_r2_list = []
+
+fig_cols = 3
+fig_rows = int(np.ceil(N_BEST_TUNING / fig_cols))
+fig, axes = plt.subplots(fig_rows, fig_cols, figsize=(
+    4*fig_cols, 3.2*fig_rows), squeeze=False)
+
+for k, c in enumerate(panel_cells):
+    ax = axes[k//fig_cols][k % fig_cols]
+    cell_trace = Y_all[:, c]
+    raw_epochs = [cell_trace[s:e] for s, e in zip(epoch_starts, epoch_ends)]
+    cell_epochs_dff = [dff_epoch_trace(ep) for ep in raw_epochs]
+
+    avg_by_label = {}
+    for lbl in sorted(set(stim_labels)):
+        idxs = [i for i, l in enumerate(stim_labels) if l == lbl]
+        if not idxs:
+            continue
+        traces = [cell_epochs_dff[i] for i in idxs]
+        Lmin = min(len(t) for t in traces) if traces else 0
+        if Lmin <= 0:
+            continue
+        stack = np.stack([t[:Lmin] for t in traces], axis=0)
+        avg_by_label[lbl] = np.nanmean(stack, axis=0)
+
+    peaks = {lbl: float(np.nanmax(tr))
+             for lbl, tr in avg_by_label.items() if lbl in label_to_angle}
+    if len(peaks) < 2:
+        ax.set_title(f"Cell {c+1}: N/A")
+        ax.axis('off')
+        continue
+
+    angle_bins = {}
+    for lbl, pk in peaks.items():
+        angv = int(label_to_angle[lbl])
+        angle_bins.setdefault(angv, []).append(pk)
+
+    ang = np.array(sorted(angle_bins.keys()), dtype=float)
+    rsp = np.array([np.nanmean(angle_bins[a])
+                   for a in sorted(angle_bins)], dtype=float)
+
+    CANON = np.array([0, 45, 90, 135], dtype=float)
+    keep_mask = np.isin(ang, CANON)
+    ang, rsp = ang[keep_mask], rsp[keep_mask]
+    si = np.argsort(ang)
+    ang, rsp = ang[si], rsp[si]
+
+    ax.set_xticks([0, 45, 90, 135])
+    ax.set_xticklabels(['0', '45', '90', '135'])
+    ax.scatter(ang, rsp, c='k', s=18, label='data')
+
+    popt = None
+    if np.unique(ang).size >= 3:
+        popt = fit_von_mises(ang, rsp)
+
+    if popt is not None:
+        x_fit = np.linspace(0, 180, 200)
+        y_fit = von_mises(x_fit, *popt)
+        if CLIP_NEGATIVE_SPLINE:
+            y_fit = np.clip(y_fit, 0, None)
+        ax.plot(x_fit, y_fit, 'r-', lw=1.5, label='von Mises')
+        y_pred = von_mises(ang, *popt)
+        ss_res = np.nansum((rsp - y_pred)**2)
+        ss_tot = np.nansum((rsp - np.nanmean(rsp))**2)
+        r2 = 1.0 - ss_res/ss_tot if ss_tot > 0 else np.nan
+        vm_r2_list.append({'cell': int(c+1), 'r2': float(r2)})
+
+    try:
+        xs = np.linspace(0, 180, 200)
+        k_spline = min(3, max(1, len(ang)-1))
+        if k_spline >= 1 and len(ang) >= 2:
+            spl = make_interp_spline(ang, rsp, k=k_spline)
+            ys = spl(xs)
+            if CLIP_NEGATIVE_SPLINE:
+                ys = np.clip(ys, 0, None)
+            ax.plot(xs, ys, 'b--', lw=1.2, label='spline')
+    except Exception:
+        pass
+
+    ax.set_xlabel('°')
+    ax.set_ylabel('Peak ΔF/F')
+    ax.set_title(f'Cell {c+1}')
+
+total_slots = fig_rows * fig_cols
+if len(panel_cells) < total_slots:
+    for kk in range(len(panel_cells), total_slots):
+        axes[kk//fig_cols][kk % fig_cols].axis('off')
+
+handles, labels = axes[0][0].get_legend_handles_labels()
+if handles:
+    fig.legend(handles, labels, loc='upper right')
+
+fig.tight_layout()
+if save_figs:
+    plt.savefig(output_dir / 'topK_tuning_curves.png',
+                dpi=160, bbox_inches='tight')
+plt.close(fig)
+
+# --- Save per-cell R² ---
+stats_dir = output_dir / "stats"
+ensure_outdir(stats_dir)
+vm_r2_df = pd.DataFrame(vm_r2_list)
+if not vm_r2_df.empty:
+    vm_r2_csv = stats_dir / "tuning_vonmises_r2.csv"
+    vm_r2_df.to_csv(vm_r2_csv, index=False)
+
+# ---------------------------------------===== Heatmaps (signals CSV)====---------------------------------------
+resp_z = zscore(Y_all, axis=0, nan_policy='omit').T  # cells × time
+
+# 1) Default (unordered) heatmap with legend
+plt.figure(figsize=(11, 6))
+im = plt.imshow(resp_z, aspect='auto', cmap='RdBu_r', origin='lower',
+                extent=[0, n_time_all / fps, 0, resp_z.shape[0]],
+                vmin=-2, vmax=2, interpolation='nearest')
+cb = plt.colorbar(im)
+cb.set_label('Activity (z-score per cell)')
+plt.xlabel('Time (s)')
+plt.ylabel('Neuron #')
+plt.title('Heatmap (signals CSV) — z-scored per neuron')
+if save_figs:
+    plt.savefig(output_dir / 'population_heatmap_zscore_signals.png',
+                dpi=160, bbox_inches='tight')
+plt.close()
+
+# 2) Ordered heatmap with legend
+if ORDER_HEATMAPS:
+    if ORDER_METHOD == 'peak_time':
+        peak_idx = np.nanargmax(resp_z, axis=1)
+        order = np.argsort(peak_idx)
+    elif ORDER_METHOD == 'activity':
+        activity = np.nanstd(resp_z, axis=1)
+        order = np.argsort(-activity)
+    else:
+        order = np.arange(resp_z.shape[0])
+
+    resp_z_ord = resp_z[order]
+    plt.figure(figsize=(11, 6))
+    im_ord = plt.imshow(resp_z_ord, aspect='auto', cmap='RdBu_r', origin='lower',
+                        extent=[0, n_time_all / fps, 0, resp_z_ord.shape[0]],
+                        vmin=-2, vmax=2, interpolation='nearest')
+    cb2 = plt.colorbar(im_ord)
+    cb2.set_label('Activity (z-score per cell)')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Neuron # (ordered)')
+    plt.title(
+        f'Heatmap (signals CSV) — ordered by {ORDER_METHOD.replace("_"," ")}')
+    if save_figs:
+        plt.savefig(output_dir / 'population_heatmap_zscore_signals_ORDERED.png',
+                    dpi=160, bbox_inches='tight')
+    plt.close()
+
+# ==== Suite2p-based maps + rasters ====
+
+AUTO_PRESTIM = globals().get('AUTO_PRESTIM', True)
+PRESTIM_SEC = globals().get('PRESTIM_SEC', 1.0)
+PRESTIM_SEC_CAP = globals().get('PRESTIM_SEC_CAP', 2.0)
+MIN_PRE_FRAMES = globals().get('MIN_PRE_FRAMES', 3)
+USE_DFF = globals().get('USE_DFF', False)
+FPS = globals().get('FPS', 7.67)
+
+RASTER_ORDER = globals().get('RASTER_ORDER', 'osi')
+RASTER_SCALE_MODE = globals().get('RASTER_SCALE_MODE', 'row')
+RASTER_GLOBAL_PLOW = globals().get('RASTER_GLOBAL_PLOW', 1.0)
+RASTER_GLOBAL_PHIGH = globals().get('RASTER_GLOBAL_PHIGH', 99.0)
+RAWF_CBAR_MIN = globals().get('RAWF_CBAR_MIN', None)
+RAWF_CBAR_MAX = globals().get('RAWF_CBAR_MAX', None)
+SPIKES_CBAR_MIN = globals().get('SPIKES_CBAR_MIN', 0.0)
+SPIKES_CBAR_MAX = globals().get('SPIKES_CBAR_MAX', 60)
+STIM_BOX_ZORDER = globals().get('STIM_BOX_ZORDER', 20)
+STIM_BOX_LINEWIDTH = globals().get('STIM_BOX_LINEWIDTH', 1.5)
+STIM_BOX_HALO = globals().get('STIM_BOX_HALO', False)
+
+suite2p_stats = globals().get('suite2p_stats', None)
+
+if S2P_DIR.exists():
+    try:
+        stat = np.load(S2P_DIR / 'stat.npy', allow_pickle=True)
+        F = np.load(S2P_DIR / 'F.npy')
+        Fneu = np.load(S2P_DIR / 'Fneu.npy')
+        spks = np.load(S2P_DIR / 'spks.npy')
+        iscell = np.load(S2P_DIR / 'iscell.npy')
+        keep = iscell[:, 0].astype(
+            bool) if iscell.ndim == 2 else iscell.astype(bool)
+        xy = np.array([s['med'][::-1] for s in stat])[keep]  # (x,y) in PIXELS
+
+        # pixels → microns
+        UM_PER_PIXEL_X = 0.78
+        UM_PER_PIXEL_Y = 0.78
+        xy_um = xy.astype(float)
+        xy_um[:, 0] *= UM_PER_PIXEL_X
+        xy_um[:, 1] *= UM_PER_PIXEL_Y
+
+        rawF_keep = F[keep]
+        spks_keep = spks[keep]
+        n_cells, n_frames = rawF_keep.shape
+
+        trials_df = trials.copy().dropna(
+            subset=['ori_deg']).sort_values('start_frame')
+        oris_deg = np.sort(trials_df['ori_deg'].unique())
+        oris_mod = (oris_deg % 180.0)
+
+        if AUTO_PRESTIM:
+            prelen_map = {}
+            prev_end = 0
+            for _, row in trials_df.iterrows():
+                s = int(row['start_frame'])
+                e = int(row['end_frame'])
+                gap_frames = max(0, s - prev_end)
+                pre_frames_i = max(MIN_PRE_FRAMES, min(
+                    gap_frames, int(round(PRESTIM_SEC_CAP * FPS))))
+                prelen_map[(s, e)] = pre_frames_i
+                prev_end = e
+        else:
+            fixed_pre_frames = int(round(PRESTIM_SEC * FPS))
+
+        def resp_trial_means_for_ori(windows):
+            if len(windows) == 0:
+                return np.full(n_cells, np.nan, dtype=np.float32)
+            out = []
+            for (s, e) in windows:
+                s, e = int(s), int(e)
+                if e <= s or s <= 0 or e > n_frames:
+                    continue
+                pre_frames_i = prelen_map.get((s, e), int(
+                    round(PRESTIM_SEC * FPS))) if AUTO_PRESTIM else fixed_pre_frames
+                pre_start = max(s - pre_frames_i, 0)
+                pre = rawF_keep[:, pre_start:s]
+                if pre.shape[1] >= MIN_PRE_FRAMES and np.all(np.isfinite(pre)):
+                    F0 = pre.mean(axis=1)
+                else:
+                    epoch = rawF_keep[:, s:e]
+                    F0 = np.nanmedian(epoch, axis=1)
+                F0 = np.where(np.isfinite(F0) & (F0 > 0), F0,
+                              np.nanmedian(rawF_keep, axis=1))
+                stim = rawF_keep[:, s:e]
+                stim_mean = np.nanmean(stim, axis=1)
+                resp_vec = (stim_mean - F0) / \
+                    F0 if USE_DFF else (stim_mean - F0)
+                out.append(resp_vec)
+            if not out:
+                return np.full(n_cells, np.nan, dtype=np.float32)
+            return np.nanmean(np.vstack(out), axis=0).astype(np.float32)
+
+        # Windows per orientation
+        ori_windows = []
+        for ori in oris_deg:
+            sub = trials_df.loc[trials_df['ori_deg'] == ori, [
+                'start_frame', 'end_frame']].to_numpy(int)
+            sub = sub[(sub[:, 1] - sub[:, 0]) >= 5]
+            ori_windows.append([tuple(x) for x in sub])
+
+        # Response matrix (cells x orientations)
+        resp = np.zeros((n_cells, len(oris_deg)), dtype=np.float32)
+        for j, windows in enumerate(ori_windows):
+            resp[:, j] = resp_trial_means_for_ori(windows)
+
+        # Preferred orientation & OSI
+        pref_idx = np.nanargmax(resp, axis=1)
+        pref_ori = oris_mod[pref_idx]
+
+        def circdist180(a, b):
+            d = np.abs(a - b) % 180.0
+            return np.minimum(d, 180.0 - d)
+
+        orth_idx = np.array([int(np.argmin(
+            np.abs(circdist180(oris_mod, po) - 90.0))) for po in pref_ori], dtype=int)
+        rows = np.arange(n_cells)
+        r_pref = np.maximum(resp[rows, pref_idx], 0.0)
+        r_orth = np.maximum(resp[rows, orth_idx], 0.0)
+        den = r_pref + r_orth
+        osi = np.full_like(r_pref, np.nan, dtype=np.float32)
+        ok_den = den > 0
+        osi[ok_den] = (r_pref[ok_den] - r_orth[ok_den]) / den[ok_den]
+        amp = r_pref.copy()
+
+        # Save per-cell metrics
+        suite2p_metrics = pd.DataFrame({
+            'cell': np.arange(1, n_cells+1, dtype=int),
+            'pref_deg': pref_ori.astype(float),
+            'osi': osi.astype(float),
+            'amp': amp.astype(float)
+        })
+        suite2p_detail_rows = []
+        for ci in range(n_cells):
+            for j, A in enumerate(oris_mod):
+                suite2p_detail_rows.append({
+                    'cell': int(ci+1),
+                    'angle_deg': float(A),
+                    'R_raw': float(resp[ci, j]),
+                    'is_pref': int(j == pref_idx[ci]),
+                    'is_orth': int(j == orth_idx[ci]),
+                })
+        if suite2p_detail_rows:
+            pd.DataFrame(suite2p_detail_rows).to_csv(
+                output_dir / 'suite2p_perangle.csv', index=False)
+
+        suite2p_metrics = suite2p_metrics.assign(
+            R_pref=resp[np.arange(n_cells), pref_idx],
+            R_orth=resp[np.arange(n_cells), orth_idx]
+        )
+        suite2p_metrics.to_csv(
+            output_dir / 'suite2p_cell_metrics.csv', index=False)
+
+        finite_counts = np.sum(np.isfinite(resp), axis=1)
+        ok = finite_counts >= 1
+        amp_plot = np.where(ok, amp, 0.0)
+        pref_plot = np.where(ok, pref_ori, np.nan)
+        osi_plot = np.where(ok, osi, np.nan)
+
+        # Preferred Orientation Map
+        plt.figure(figsize=(6.5, 6.5), facecolor='w')
+        if np.any(ok):
+            sc = plt.scatter(xy_um[ok, 0], xy_um[ok, 1],
+                             c=pref_plot[ok], cmap='hsv', vmin=0, vmax=180,
+                             s=np.clip(amp_plot[ok], 0, None) * 1.0, alpha=0.9, edgecolors='k')
+            cb = plt.colorbar(sc, label='Preferred orientation (deg)')
+            ticks = np.unique(np.round((oris_mod % 180.0)).astype(int))
+            cb.set_ticks(list(ticks))
+            cb.set_ticklabels([f'{t}°' for t in ticks])
+        plt.gca().invert_yaxis()
+        plt.axis('equal')
+        plt.xlabel('X (µm)')
+        plt.ylabel('Y (µm)')
+        plt.title('Preferred Orientation (color), Amplitude (size)')
+        if save_figs:
+            plt.savefig(output_dir / 'pref_orientation_map.png', dpi=220)
+        plt.close()
+
+        # OSI Map
+        plt.figure(figsize=(6.5, 6.5), facecolor='w')
+        if np.any(ok):
+            sc2 = plt.scatter(xy_um[ok, 0], xy_um[ok, 1],
+                              c=osi_plot[ok], cmap='plasma', vmin=0, vmax=1,
+                              s=np.clip(amp_plot[ok], 0, None) * 1.5, alpha=0.9, edgecolors='k')
+            plt.colorbar(sc2, label='OSI (0–1)')
+        plt.gca().invert_yaxis()
+        plt.axis('equal')
+        plt.xlabel('X (µm)')
+        plt.ylabel('Y (µm)')
+        plt.title('OSI (color), Amplitude (size)')
+        if save_figs:
+            plt.savefig(output_dir / 'osi_map.png', dpi=220)
+        plt.close()
+
+        # --- Rasters: white dotted lines ONLY (no spans, no labels) ---
+
+        def _robust_minmax_rows(mat, p_low=1.0, p_high=99.0):
+            lo = np.nanpercentile(mat, p_low, axis=1, keepdims=True)
+            hi = np.nanpercentile(mat, p_high, axis=1, keepdims=True)
+            scale = np.maximum(hi - lo, 1e-9)
+            return np.clip((mat - lo) / scale, 0.0, 1.0)
+
+        ORDER_LABEL = {'none': 'row order', 'prefori': 'preferred orientation',
+                       'amp': 'amplitude', 'osi': 'OSI'}.get(RASTER_ORDER, 'row order')
+        if RASTER_ORDER == 'prefori':
+            order_idx = np.argsort(
+                np.where(np.isfinite(pref_plot), pref_plot, 1e9))
+        elif RASTER_ORDER == 'amp':
+            order_idx = np.argsort(-np.where(np.isfinite(amp_plot),
+                                   amp_plot, -np.inf))
+        elif RASTER_ORDER == 'osi':
+            order_idx = np.argsort(-np.where(np.isfinite(osi_plot),
+                                   osi_plot, -np.inf))
+        else:
+            order_idx = np.arange(n_cells)
+
+        rawF_ord = rawF_keep[order_idx]
+        spks_ord = spks_keep[order_idx]
+
+        # RAW-F raster
+        fig, ax = plt.subplots(figsize=(12, 6), facecolor='w')
+        T_end = rawF_ord.shape[1] / FPS
+        if RASTER_SCALE_MODE == 'row':
+            data = _robust_minmax_rows(rawF_ord)
+            vmin, vmax = 0.0, 1.0
+            label = 'raw F (row-scaled 1–99% → 0–1)'
+        elif RASTER_SCALE_MODE == 'fixed':
+            if RAWF_CBAR_MIN is None or RAWF_CBAR_MAX is None:
+                raise ValueError(
+                    "Set RAWF_CBAR_MIN and RAWF_CBAR_MAX when RASTER_SCALE_MODE='fixed'.")
+            data = rawF_ord
+            vmin, vmax = float(RAWF_CBAR_MIN), float(RAWF_CBAR_MAX)
+            label = f'raw F (fixed {RAWF_CBAR_MIN}–{RAWF_CBAR_MAX})'
+        elif RASTER_SCALE_MODE == 'global':
+            finite = rawF_ord[np.isfinite(rawF_ord)]
+            if finite.size == 0:
+                vmin, vmax = 0.0, 1.0
+            else:
+                vmin = np.percentile(finite, RASTER_GLOBAL_PLOW)
+                vmax = np.percentile(finite, RASTER_GLOBAL_PHIGH)
+                if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                    vmin, vmax = float(np.nanmin(finite)), float(
+                        np.nanmax(finite))
+            data = rawF_ord
+            label = f'raw F (global {RASTER_GLOBAL_PLOW}–{RASTER_GLOBAL_PHIGH}th pct)'
+        else:
+            data = rawF_ord
+            vmin = vmax = None
+            label = 'raw F (a.u.)'
+
+        im = ax.imshow(data, aspect='auto', interpolation='nearest', origin='lower', cmap='viridis',
+                       vmin=vmin, vmax=vmax, extent=(0, T_end, -0.5, rawF_ord.shape[0]-0.5))
+        plt.colorbar(im, ax=ax, label=label)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel(f'Cell (kept, ordered by {ORDER_LABEL})')
+        ax.set_title('Raw F Raster with stimulus (white dotted)')
+
+        for _, row in trials_df.iterrows():
+            s = int(row['start_frame'])
+            e = int(row['end_frame'])
+            if e <= s:
+                continue
+            for x in (s, e):
+                x_sec = x / FPS
+                ln = ax.axvline(x_sec, color='w', linestyle=':',
+                                linewidth=1.5, zorder=STIM_BOX_ZORDER)
+                if STIM_BOX_HALO:
+                    ln.set_path_effects(
+                        [pe.withStroke(linewidth=STIM_BOX_LINEWIDTH+1.2, foreground='k')])
+
+        if save_figs:
+            plt.savefig(output_dir / 'raster_rawF_dotted_overlay.png',
+                        dpi=220, bbox_inches='tight')
+        plt.close(fig)
+
+        # Spikes raster
+        if spks_ord is not None and spks_ord.size:
+            fig2, ax2 = plt.subplots(figsize=(12, 6), facecolor='w')
+            T_end2 = spks_ord.shape[1] / FPS
+            im2 = ax2.imshow(spks_ord, aspect='auto', interpolation='nearest', origin='lower', cmap='viridis',
+                             vmin=SPIKES_CBAR_MIN, vmax=SPIKES_CBAR_MAX,
+                             extent=(0, T_end2, -0.5, spks_ord.shape[0]-0.5))
+            plt.colorbar(
+                im2, ax=ax2, label=f'spikes ({SPIKES_CBAR_MIN}–{SPIKES_CBAR_MAX})')
+            ax2.set_xlabel('Time (s)')
+            ax2.set_ylabel(f'Cell (kept, ordered by {ORDER_LABEL})')
+            ax2.set_title('Spikes Raster with stimulus (white dotted)')
+
+            for _, row in trials_df.iterrows():
+                s = int(row['start_frame'])
+                e = int(row['end_frame'])
+                if e <= s:
+                    continue
+                for x in (s, e):
+                    x_sec = x / FPS
+                    ln = ax2.axvline(x_sec, color='w', linestyle=':',
+                                     linewidth=1.5, zorder=STIM_BOX_ZORDER)
+                    if STIM_BOX_HALO:
+                        ln.set_path_effects(
+                            [pe.withStroke(linewidth=STIM_BOX_LINEWIDTH+1.2, foreground='k')])
+
+            if save_figs:
+                plt.savefig(
+                    output_dir / 'raster_spikes_dotted_overlay.png', dpi=220, bbox_inches='tight')
+            plt.close(fig2)
+
+    except Exception as e:
+        warnings.warn(f"Suite2p section skipped due to error: {e}")
+else:
+    print(
+        f"[info] Suite2p directory not found; skipped salt-and-pepper maps: {S2P_DIR}")
+
+# ---------------------------------------- ===== Population OSI + angle histos (signals summary) ==== ----------------------------------------
+signals_metrics_rows = []
+pop_pref_angles, pop_osi = [], []
+_epoch_pairs = list(zip(epoch_starts, epoch_ends))
+
+for c in range(n_cells_all):
+    # gather ΔF/F trials by label
+    per_label_traces = {lbl: [] for lbl in label_to_angle}
+    for (s, e), lbl in zip(_epoch_pairs, stim_labels):
+        if lbl in label_to_angle:
+            dff = dff_epoch_trace(Y_all[s:e, c])
+            per_label_traces[lbl].append(dff)
+
+    # per-label peaks (RAW for selection; rectified=non-negative for OSI)
+    peaks_raw, peaks_rect = {}, {}
+    for lbl, lst in per_label_traces.items():
+        if not lst:
+            continue
+        Lmin = min(len(t) for t in lst)
+        if Lmin <= 0:
+            continue
+        avg = np.nanmean(np.stack([t[:Lmin] for t in lst], axis=0), axis=0)
+        pk_raw = float(np.nanmax(avg))
+        peaks_raw[lbl] = pk_raw
+        peaks_rect[lbl] = max(0.0, pk_raw)
+
+    usable = [lbl for lbl in peaks_raw if lbl in label_to_angle]
+    if len(usable) < 2:
+        continue  # need at least two orientations to define OSI
+
+    ang = np.array([label_to_angle[lbl] for lbl in usable], float)
+    rsp_raw = np.array([peaks_raw[lbl] for lbl in usable], float)
+    rsp_rect = np.array([peaks_rect[lbl] for lbl in usable], float)
+
+    # preferred from RAW peaks
+    i_pref = int(np.nanargmax(rsp_raw))
+    pref_angle = float(ang[i_pref])
+
+    # nearest orthogonal among present angles
+    target_orth = (pref_angle + 90.0) % 180.0
+    i_orth = int(np.argmin(np.abs(((ang - target_orth + 90) % 180) - 90)))
+
+    # OSI from rectified magnitudes
+    R_pref = float(rsp_rect[i_pref])
+    R_orth = float(rsp_rect[i_orth])
+    osi_val = (R_pref - R_orth) / (R_pref + R_orth + 1e-12)
+
+    signals_metrics_rows.append(
+        {'cell': int(c+1), 'pref_deg': pref_angle, 'osi': float(osi_val)})
+    pop_pref_angles.append(pref_angle)
+    pop_osi.append(osi_val)
+
+# Save per-cell summary
+if signals_metrics_rows:
+    pd.DataFrame(signals_metrics_rows).to_csv(
+        output_dir / 'signals_cell_metrics.csv', index=False)
+
+# -------------------- angle-wise details for signals path --------------------
+signals_detail_rows = []
+for c in range(n_cells_all):
+    per_label_traces = {lbl: [] for lbl in label_to_angle}
+    for (s, e), lbl in zip(_epoch_pairs, stim_labels):
+        if lbl in label_to_angle:
+            dff = dff_epoch_trace(Y_all[s:e, c])
+            per_label_traces[lbl].append(dff)
+
+    peaks_raw, peaks_rect = {}, {}
+    for lbl, lst in per_label_traces.items():
+        if not lst:
+            continue
+        L = min(len(t) for t in lst)
+        if L <= 0:
+            continue
+        avg = np.nanmean(np.stack([t[:L] for t in lst], axis=0), axis=0)
+        pk_raw = float(np.nanmax(avg))
+        peaks_raw[lbl] = pk_raw
+        peaks_rect[lbl] = max(0.0, pk_raw)
+
+    usable = [lbl for lbl in peaks_raw if lbl in label_to_angle]
+    if len(usable) < 2:
+        continue
+
+    angs = np.array([label_to_angle[lbl] for lbl in usable], float)
+    rsp_raw = np.array([peaks_raw[lbl] for lbl in usable], float)
+    rsp_rect = np.array([peaks_rect[lbl] for lbl in usable], float)
+
+    i_pref = int(np.nanargmax(rsp_raw))
+
+    for j, A in enumerate(angs):
+        target = (A + 90.0) % 180.0
+        j_orth = int(np.argmin(np.abs(((angs - target + 90) % 180) - 90)))
+        Rj_rect = float(rsp_rect[j])
+        Rorth_rect = float(rsp_rect[j_orth])
+        osi_this = (Rj_rect - Rorth_rect) / (Rj_rect + Rorth_rect + 1e-12)
+        signals_detail_rows.append({
+            'cell': int(c+1),
+            'angle_deg': float(A),
+            'R_raw':  float(rsp_raw[j]),
+            'R_rect': float(rsp_rect[j]),
+            'orth_angle_deg_for_this': float(angs[j_orth]),
+            'R_orth_rect_for_this': Rorth_rect,
+            'OSI_this_angle': float(osi_this),
+            'is_pref_from_RAW': int(j == i_pref),
+        })
+
+if signals_detail_rows:
+    pd.DataFrame(signals_detail_rows).to_csv(
+        output_dir / 'signals_perangle.csv', index=False)
+
+# -------- Population plots --------
+
+
+def half_polar_rose(angles_deg, weights=None, title='', fname='rose.png'):
+    bins = np.arange(0, 181, 15)
+    hist, edges = np.histogram(angles_deg, bins=bins, weights=weights)
+    centers = np.deg2rad(0.5*(edges[:-1] + edges[1:]))
+    width = np.deg2rad(np.diff(edges))
+
+    fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(4, 4))
+    ax.bar(centers, hist, width=width, bottom=0.0, align='center',
+           edgecolor='k', linewidth=0.5, alpha=0.8)
+    ax.set_theta_zero_location('N')
+    ax.set_theta_direction(-1)
+    ax.set_thetamin(0)
+    ax.set_thetamax(180)
+    ax.set_title(title)
+    if save_figs:
+        plt.savefig(output_dir / fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
+if signals_metrics_rows:
+    angs = np.array([row['pref_deg']
+                    for row in signals_metrics_rows], dtype=float)
+    osis = np.array([row['osi'] for row in signals_metrics_rows], dtype=float)
+    half_polar_rose(
+        angs, None, 'Orientation preference (counts)', 'rose_counts.png')
+    half_polar_rose(
+        angs, osis, 'Orientation preference (OSI-weighted)', 'rose_osiweighted.png')
+
+if len(pop_pref_angles) > 0:
+    ordered_angles = sorted(set(label_to_angle.values()))
+    counts = [sum(1 for a in pop_pref_angles if a == A)
+              for A in ordered_angles]
+    plt.figure()
+    plt.bar([str(int(A)) for A in ordered_angles], counts)
+    plt.xlabel('Preferred orientation (°)')
+    plt.ylabel('Cell count')
+    plt.title('Population: preferred orientation distribution')
+    if save_figs:
+        plt.savefig(output_dir / 'population_pref_orientation_hist.png',
+                    dpi=160, bbox_inches='tight')
+    plt.close()
+if len(pop_osi) > 0:
+    plt.figure()
+    plt.hist(pop_osi, bins=15, range=(0, 1))
+    plt.xlabel('OSI')
+    plt.ylabel('Cell count')
+    plt.title('Population: OSI distribution')
+    if save_figs:
+        plt.savefig(output_dir / 'population_osi_hist.png',
+                    dpi=160, bbox_inches='tight')
+    plt.close()
+
+# ------------------------- ===== stats.txt writer === ----------------------------------------------
+stats_dir = output_dir / "stats"
+ensure_outdir(stats_dir)
+lines = []
+lines += [
+    "Session summary",
+    f"  Frames: {n_time_all}",
+    f"  Duration (s): {n_time_all/fps:.2f}",
+    f"  FPS: {fps}",
+    f"  #Cells (signals CSV): {n_cells_all}",
+    f"  #Epochs (valid): {len(epoch_starts)}",
+    f"  Timing mode: {timing_mode}",
+    f"  First stim offset vs imaging start (s): {offsets_s[0]:.3f}",
+    ""
+]
+
+# Signals CSV — trace quality (SNR)
+stim_mask = np.zeros(n_time_all, dtype=bool)
+for s, e in zip(epoch_starts, epoch_ends):
+    stim_mask[s:e] = True
+base_mask = ~stim_mask
+eps = 1e-9
+snr_list = []
+for c in range(n_cells_all):
+    stim_std = np.nanstd(Y_all[stim_mask, c]) if stim_mask.any() else np.nan
+    base_std = np.nanstd(Y_all[base_mask, c]) if base_mask.any() else np.nan
+    snr = (stim_std / (base_std + eps)
+           ) if np.isfinite(stim_std) and np.isfinite(base_std) else np.nan
+    snr_list.append(snr)
+snr_arr = np.array(snr_list, dtype=float)
+
+lines += [
+    "Signals CSV — trace quality (SNR = std_stim / std_base)",
+    f"  median SNR: {np.nanmedian(snr_arr):.3f}",
+    f"  IQR SNR: {iqr(snr_arr):.3f}",
+    f"  fraction SNR ≥ 1.0: {np.nanmean(snr_arr >= 1.0):.3f}",
+    ""
+]
+
+# Population tuning (signals CSV)
+pop_osi_arr = np.array(pop_osi, dtype=float)
+lines += [
+    "Population tuning (signals CSV)",
+    f"  OSI count: {np.sum(np.isfinite(pop_osi_arr))}",
+    f"  OSI median: {np.nanmedian(pop_osi_arr):.3f}",
+    f"  OSI IQR: {iqr(pop_osi_arr):.3f}",
+    f"  fraction tuned (OSI ≥ 0.30): {np.nanmean(pop_osi_arr >= 0.30):.3f}",
+]
+po_counts = {}
+for A in sorted(set(label_to_angle.values())):
+    po_counts[int(A)] = int(sum(1 for a in pop_pref_angles if a == A))
+lines.append("  preferred orientation counts: " +
+             ", ".join([f"{k}°={v}" for k, v in po_counts.items()]))
+lines.append("")
+
+if suite2p_stats is not None:
+    amp = suite2p_stats["amp"]
+    osi_s2p = suite2p_stats["osi"]
+    lines += [
+        "Suite2p (iscell) summary",
+        f"  total ROIs: {suite2p_stats['n_total_rois']}",
+        f"  kept (iscell=1): {suite2p_stats['n_keep']}  ({suite2p_stats['keep_frac']*100:.1f}%)",
+        f"  amplitude (pref response) — median: {np.nanmedian(amp):.4f}, IQR: {iqr(amp):.4f}, p95: {np.nanpercentile(amp,95):.4f}",
+        f"  OSI — count: {np.sum(np.isfinite(osi_s2p))}, median: {np.nanmedian(osi_s2p):.3f}, IQR: {iqr(osi_s2p):.3f}, fraction tuned (≥0.30): {np.nanmean(osi_s2p >= 0.30):.3f}",
+        ""
+    ]
+else:
+    lines += ["Suite2p (iscell) summary",
+              "  (no suite2p directory found or section failed)", ""]
+
+vm_r2_arr = np.array([row['r2'] for row in vm_r2_list],
+                     dtype=float) if vm_r2_list else np.array([])
+lines += [
+    "Top-5 von Mises fit quality (signals-based tuning)",
+    f"  R² count: {np.sum(np.isfinite(vm_r2_arr)) if vm_r2_arr.size else 0}",
+    f"  R² median: {np.nanmedian(vm_r2_arr):.3f}" if vm_r2_arr.size else "  R² median: N/A",
+    f"  R² IQR: {iqr(vm_r2_arr):.3f}" if vm_r2_arr.size else "  R² IQR: N/A",
+    ""
+]
+
+(stats_dir / "stats.txt").write_text("\n".join(lines) + "\n")
+print(f"[save] Wrote stats → {stats_dir / 'stats.txt'}")
+print("\nAll done. Figures & trials.csv saved to:", output_dir)
