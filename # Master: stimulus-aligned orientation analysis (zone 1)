@@ -18,25 +18,36 @@ from scipy.interpolate import make_interp_spline
 from scipy.stats import zscore
 
 # ----------------------===== USER INPUTS =====----------------------
+# Update the values in this section for each new recording/session.
 
+# --- Core file locations ---
 signals_csv_path = "/Users/karimaghimire/Desktop/05042/Z1_OUT/Z1_OUT.csv"
 stimlog_csv_path = "/Users/karimaghimire/Desktop/05042/Z1_OUT/stimulus_log.csv"
 output_dir = Path("/Users/karimaghimire/Desktop/05042/Z1_OUT/output_master")
 S2P_DIR = Path("/Users/karimaghimire/Desktop/05042/Z1_OUT/suite2p/plane0")
 
+# --- Imaging start time ---
 USE_HUMAN_IMAGING_START = True
 imaging_start_human = "2025-05-06 11:29:38.927"  # local human time w/ ms
 local_tz = zoneinfo.ZoneInfo("Europe/London")
 imaging_start_unix_s_override = None
 
+# --- Acquisition parameters ---
 fps = 7.67
 
+# --- Figure saving behaviour ---
 save_figs = True
 show_figs = False
 
 DO_PER_CELL_PLOTS = True
 ORDER_HEATMAPS = True
 ORDER_METHOD = 'peak_time'  # 'peak_time' or 'activity'
+
+# Bias diagnostics configuration
+# Turn this on to generate quick orientation balance reports and plots.
+ENABLE_BIAS_DIAGNOSTICS = True
+BIAS_OSI_MIN = 0.30  # focus on tuned cells at/above this OSI
+BIAS_DIAGNOSTICS_FILENAME = 'bias_diagnostics.txt'
 
 N_BEST_EXAMPLE = 6
 N_BEST_TUNING = 6
@@ -58,6 +69,7 @@ JITTER_PX = 0.0
 INSUFFICIENT_GRAY = '#C8C8C8'
 
 # Stimulus → angle
+# Map each stimulus label in the log to a canonical orientation in degrees.
 label_to_angle = {
     'flicker_1': 0,
     'flicker_2': 45,
@@ -72,10 +84,12 @@ NEUCOEFF = 0.7
 
 
 def ensure_outdir(path: Path):
+    """Create *path* and its parents if they do not already exist."""
     path.mkdir(parents=True, exist_ok=True)
 
 
 def load_signals_keep_y(csv_path: str):
+    """Return the Y-channel traces from the signals CSV as a 2D NumPy array."""
     df = pd.read_csv(csv_path)
     ycols = [c for c in df.columns if 'y' in str(c).lower()]
     if not ycols:
@@ -89,6 +103,7 @@ def load_signals_keep_y(csv_path: str):
 
 
 def load_stimlog_csv(stim_csv_path: str):
+    """Load the stimulus log and return parallel arrays for labels, iterations, and times."""
     df = pd.read_csv(stim_csv_path)
     required = ['Stimulus', 'Iteration', 'Start time', 'End time']
     for col in required:
@@ -101,11 +116,13 @@ def load_stimlog_csv(stim_csv_path: str):
 
 
 def to_unix_from_human(dt_str: str, tz) -> float:
+    """Convert a human-readable timestamp into a Unix epoch (seconds)."""
     dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=tz)
     return dt.timestamp()
 
 
 def dff_epoch_trace(trace_1d: np.ndarray) -> np.ndarray:
+    """Compute ΔF/F for a 1D trace with a robust fallback baseline."""
     if trace_1d.size == 0 or np.all(~np.isfinite(trace_1d)):
         return np.zeros_like(trace_1d, dtype=float)
     p10 = np.nanpercentile(trace_1d, 10)
@@ -116,6 +133,7 @@ def dff_epoch_trace(trace_1d: np.ndarray) -> np.ndarray:
 
 
 def stimlog_to_frames(start_ms: np.ndarray, end_ms: np.ndarray, imaging_start_unix_s: float, fs: float, n_time_all: int):
+    """Translate stimulus start/end times into frame indices for the recording."""
     looks_unix = np.nanmedian(start_ms) > 1e11
     if looks_unix:
         offsets_s = (start_ms / 1000.0) - imaging_start_unix_s
@@ -138,6 +156,7 @@ def stimlog_to_frames(start_ms: np.ndarray, end_ms: np.ndarray, imaging_start_un
 
 
 def get_best_cells(Y_all: np.ndarray, epoch_starts: np.ndarray, epoch_ends: np.ndarray, n_best: int = 4):
+    """Select the top *n_best* cells based on their maximum ΔF/F response."""
     n_cells = Y_all.shape[1]
     peaks = np.zeros(n_cells)
     for c in range(n_cells):
@@ -164,6 +183,7 @@ def fit_von_mises(angles, responses):
 
 
 def iqr(x):
+    """Inter-quartile range that tolerates NaNs."""
     x = np.asarray(x)
     x = x[np.isfinite(x)]
     if x.size == 0:
@@ -171,8 +191,113 @@ def iqr(x):
     return np.nanpercentile(x, 75) - np.nanpercentile(x, 25)
 
 
+def run_bias_diagnostics(pref_deg, osi, label, available_angles, outdir, report_path, osi_min, save_plots):
+    """Summarise orientation preference counts/OSI to catch manual biases."""
+    pref_deg = np.asarray(pref_deg, dtype=float)
+    osi = np.asarray(osi, dtype=float)
+    mask = np.isfinite(pref_deg)
+    pref_deg = np.mod(pref_deg[mask], 180.0)
+    osi = osi[mask]
+
+    if pref_deg.size == 0:
+        warnings.warn(f"[bias] No finite preferred angles available for {label} diagnostics.")
+        return
+
+    available_angles = sorted({float(a % 180.0) for a in available_angles})
+    if not available_angles:
+        warnings.warn(f"[bias] No reference angles provided for {label} diagnostics.")
+        return
+
+    total = pref_deg.size
+    rows = []
+
+    def _angle_mask(data, target):
+        return np.isclose(np.mod(data - target, 180.0), 0.0, atol=1e-3)
+
+    for ang in available_angles:
+        idx = _angle_mask(pref_deg, ang)
+        count_all = int(np.sum(idx))
+        if count_all == 0:
+            rows.append({
+                'angle_deg': float(ang),
+                'count_all': 0,
+                'fraction_all': 0.0,
+                'count_osi>=threshold': 0,
+                'fraction_osi>=threshold': 0.0,
+                'median_osi': np.nan,
+                'mean_osi': np.nan,
+            })
+            continue
+
+        osi_subset = osi[idx]
+        count_tuned = int(np.sum(osi_subset >= osi_min))
+        rows.append({
+            'angle_deg': float(ang),
+            'count_all': count_all,
+            'fraction_all': count_all / total,
+            'count_osi>=threshold': count_tuned,
+            'fraction_osi>=threshold': count_tuned / total,
+            'median_osi': float(np.nanmedian(osi_subset)),
+            'mean_osi': float(np.nanmean(osi_subset)),
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path = outdir / f'bias_diag_{label}.csv'
+    df.to_csv(csv_path, index=False)
+
+    summary_lines = [
+        f"[bias::{label}] total_cells = {total}",
+        f"[bias::{label}] OSI threshold = {osi_min}",
+    ]
+    for row in rows:
+        summary_lines.append(
+            f"  angle {row['angle_deg']:>6.1f}° → count_all={row['count_all']:>4d}"
+            f" ({row['fraction_all']:.3f}), tuned={row['count_osi>=threshold']:>4d}"
+            f" ({row['fraction_osi>=threshold']:.3f}), median_osi={row['median_osi']:.3f}"
+        )
+
+    if report_path is not None:
+        with report_path.open('a', encoding='utf-8') as f:
+            f.write('\n'.join(summary_lines) + '\n')
+
+    print('\n'.join(summary_lines))
+
+    if save_plots and not df.empty:
+        labels = [f"{row['angle_deg']:.0f}" for row in rows]
+        counts_all = df['count_all'].to_numpy()
+        counts_tuned = df['count_osi>=threshold'].to_numpy()
+
+        fig, ax = plt.subplots(figsize=(6, 4), facecolor='w')
+        ax.bar(labels, counts_all, label='All cells', alpha=0.8)
+        ax.bar(labels, counts_tuned, label=f'OSI ≥ {osi_min:.2f}', alpha=0.6)
+        ax.set_xlabel('Preferred orientation (°)')
+        ax.set_ylabel('Cell count')
+        ax.set_title(f'Bias diagnostic – {label}')
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(outdir / f'bias_diag_{label}_counts.png', dpi=200)
+        plt.close(fig)
+
+        fig2, ax2 = plt.subplots(figsize=(6, 4), facecolor='w')
+        ax2.bar(labels, df['fraction_all'], label='All cells', alpha=0.8)
+        ax2.bar(labels, df['fraction_osi>=threshold'], label=f'OSI ≥ {osi_min:.2f}', alpha=0.6)
+        ax2.set_xlabel('Preferred orientation (°)')
+        ax2.set_ylabel('Fraction of population')
+        ax2.set_title(f'Bias diagnostic (fractions) – {label}')
+        ax2.legend()
+        plt.tight_layout()
+        plt.savefig(outdir / f'bias_diag_{label}_fractions.png', dpi=200)
+        plt.close(fig2)
+
+
 # --------------------------===== LOAD & ALIGN =======-------------------------------------------------
 ensure_outdir(output_dir)
+
+# Reset the bias summary file so each run starts fresh.
+bias_report_path = None
+if ENABLE_BIAS_DIAGNOSTICS:
+    bias_report_path = output_dir / BIAS_DIAGNOSTICS_FILENAME
+    bias_report_path.write_text("Orientation bias diagnostics\n\n", encoding='utf-8')
 
 if USE_HUMAN_IMAGING_START:
     imaging_start_unix_s = to_unix_from_human(imaging_start_human, local_tz)
@@ -190,6 +315,7 @@ print(
 
 stim_labels, iterations, start_ms, end_ms = load_stimlog_csv(
     str(stimlog_csv_path))
+# Normalise any legacy "catch" label to the 135° flicker bucket for consistency.
 stim_labels = ['flicker_5' if s == 'catch' else s for s in stim_labels]
 print(f"[stimlog] Loaded {len(stim_labels)} epochs")
 
@@ -215,6 +341,7 @@ if not np.all(valid):
     stim_labels = [lab for k, lab in enumerate(stim_labels) if valid[k]]
     iterations = [it for k, it in enumerate(iterations) if valid[k]]
 
+# Build a tidy table linking each trial to its frame window for downstream use.
 trials = pd.DataFrame({
     'trial': iterations,
     'label': stim_labels,
@@ -588,6 +715,8 @@ STIM_BOX_HALO = globals().get('STIM_BOX_HALO', False)
 
 suite2p_stats = globals().get('suite2p_stats', None)
 
+suite2p_metrics_df = None
+
 if S2P_DIR.exists():
     try:
         stat = np.load(S2P_DIR / 'stat.npy', allow_pickle=True)
@@ -716,6 +845,7 @@ if S2P_DIR.exists():
         )
         suite2p_metrics.to_csv(
             output_dir / 'suite2p_cell_metrics.csv', index=False)
+        suite2p_metrics_df = suite2p_metrics
 
         finite_counts = np.sum(np.isfinite(resp), axis=1)
         ok = finite_counts >= 1
@@ -876,6 +1006,19 @@ else:
     print(
         f"[info] Suite2p directory not found; skipped salt-and-pepper maps: {S2P_DIR}")
 
+# Quick orientation sanity-check from Suite2p derived metrics.
+if ENABLE_BIAS_DIAGNOSTICS and suite2p_metrics_df is not None:
+    run_bias_diagnostics(
+        pref_deg=suite2p_metrics_df['pref_deg'],
+        osi=suite2p_metrics_df['osi'],
+        label='suite2p',
+        available_angles=label_to_angle.values(),
+        outdir=output_dir,
+        report_path=bias_report_path,
+        osi_min=BIAS_OSI_MIN,
+        save_plots=save_figs,
+    )
+
 # ---------------------------------------- ===== Population OSI + angle histos (signals summary) ==== ----------------------------------------
 signals_metrics_rows = []
 pop_pref_angles, pop_osi = [], []
@@ -929,9 +1072,24 @@ for c in range(n_cells_all):
     pop_osi.append(osi_val)
 
 # Save per-cell summary
+signals_metrics_df = None
 if signals_metrics_rows:
-    pd.DataFrame(signals_metrics_rows).to_csv(
+    signals_metrics_df = pd.DataFrame(signals_metrics_rows)
+    signals_metrics_df.to_csv(
         output_dir / 'signals_cell_metrics.csv', index=False)
+
+# Repeat the same bias QA for ΔF/F derived metrics.
+if ENABLE_BIAS_DIAGNOSTICS and signals_metrics_df is not None:
+    run_bias_diagnostics(
+        pref_deg=signals_metrics_df['pref_deg'],
+        osi=signals_metrics_df['osi'],
+        label='signals',
+        available_angles=label_to_angle.values(),
+        outdir=output_dir,
+        report_path=bias_report_path,
+        osi_min=BIAS_OSI_MIN,
+        save_plots=save_figs,
+    )
 
 # -------------------- angle-wise details for signals path --------------------
 signals_detail_rows = []
@@ -989,6 +1147,7 @@ if signals_detail_rows:
 
 
 def half_polar_rose(angles_deg, weights=None, title='', fname='rose.png'):
+    """Helper for north-up polar histograms covering 0–180°."""
     bins = np.arange(0, 181, 15)
     hist, edges = np.histogram(angles_deg, bins=bins, weights=weights)
     centers = np.deg2rad(0.5*(edges[:-1] + edges[1:]))
