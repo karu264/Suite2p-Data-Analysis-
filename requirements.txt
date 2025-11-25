@@ -1,0 +1,21 @@
+# Core dependencies
+suite2p>=0.10.0
+numpy>=1.19.0
+scipy>=1.5.0
+matplotlib>=3.3.0
+pandas>=1.1.0
+
+# Data handling
+h5py>=2.10.0
+
+# Visualization
+seaborn>=0.11.0
+plotly>=4.14.0
+
+# Statistical analysis
+scikit-learn>=0.24.0
+statsmodels>=0.12.0
+
+# Jupyter support (optional)
+jupyter>=1.0.0
+ipython>=7.16.0
